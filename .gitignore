@@ -1,0 +1,6 @@
+node_modules/
+*.log
+
+# Optional repo-local context file pattern if --context-file is inside app repo.
+# Add this line in the target app repo's .gitignore when using a repo-local context file.
+# .opencode/skills/screenshot-skill/state/context.json
