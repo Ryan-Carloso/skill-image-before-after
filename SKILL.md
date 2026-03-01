@@ -119,6 +119,6 @@ Auto mode behavior:
 
 - If `origin` is GitLab, missing `gh` is irrelevant; only `glab` is needed for auto-update.
 - If `origin` is GitHub, missing `glab` is irrelevant; only `gh` is needed for auto-update.
-- If the target PR/MR has no description/template body, create a new default template body and include the BEFORE/AFTER section.
+- If the target PR/MR has no description/template body, create a standardized template with `Summary`, `What Changed`, `Validation`, `Notes`, and the `Before & After` section.
 - This skill does not require `.github/pull_request_template.md` or GitLab MR template files to exist in the repository.
 - If no provider CLI is installed, still capture/commit/push screenshots and print markdown for manual paste.

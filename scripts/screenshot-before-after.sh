@@ -352,7 +352,22 @@ build_default_review_template() {
   cat <<EOF
 ## Summary
 
-- Capture BEFORE/AFTER screenshots for UI review.
+- Add BEFORE/AFTER screenshot evidence for UI review.
+
+## What Changed
+
+- Capture a deterministic BEFORE screenshot from the base branch.
+- Capture an AFTER screenshot from the feature branch.
+- Commit and push screenshot assets to the feature branch.
+
+## Validation
+
+- [ ] Visual check completed for BEFORE and AFTER images.
+- [ ] Screenshot paths and links render correctly in the review description.
+
+## Notes
+
+- Replace checklist items or add context specific to this change.
 
 $section_text
 EOF
