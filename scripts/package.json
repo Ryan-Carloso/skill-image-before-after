@@ -1,8 +1,8 @@
 {
-  "name": "gitlab-rn-web-before-after-scripts",
+  "name": "git-host-rn-web-before-after-scripts",
   "private": true,
   "version": "1.0.0",
-  "description": "Minimal screenshot capture helper for GitLab RN web before/after workflow",
+  "description": "Minimal screenshot capture helper for GitHub/GitLab RN web before/after workflow",
   "license": "MIT",
   "type": "commonjs",
   "dependencies": {

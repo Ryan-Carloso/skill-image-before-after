@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 CAPTURE_JS="$SCRIPT_DIR/capture.js"
 
 REPO=""
-MR_ID=""
+REVIEW_ID=""
 BASE_BRANCH_INPUT="origin/main"
 FEATURE_BRANCH=""
 TARGET_URL=""
@@ -29,18 +29,22 @@ SERVER_LOG=""
 RESOLVED_REPO=""
 BASE_REF=""
 BASE_LOCAL=""
+ORIGIN_URL=""
+ORIGIN_HOST=""
+PROJECT_PATH=""
+GIT_PROVIDER="unknown"
 
 usage() {
   cat <<'EOF'
 screenshot-before-after.sh
 
-Capture BEFORE/AFTER screenshots for a React Native web app and update a GitLab MR.
+Capture BEFORE/AFTER screenshots for a React Native web app and update a GitHub PR or GitLab MR.
 
 Required:
   --repo <path>
 
 Optional:
-  --mr-id <id>
+  --review-id <id>                Pull request / merge request ID
   --base-branch <name>            Default: origin/main (accepts origin/main or main)
   --feature-branch <name>         Default: current branch
   --url <url>                     Default: --server-url
@@ -60,8 +64,8 @@ Optional:
   -h, --help
 
 Examples:
-  ./screenshot-before-after.sh --repo /work/app --mr-id 12 --mode both
-  ./screenshot-before-after.sh --repo /work/app --mr-id 12 --mode before
+  ./screenshot-before-after.sh --repo /work/app --review-id 12 --mode both
+  ./screenshot-before-after.sh --repo /work/app --review-id 12 --mode before
   ./screenshot-before-after.sh --repo /work/app --mode after
 EOF
 }
@@ -127,14 +131,14 @@ write_context() {
   ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
   mkdir -p "$(dirname "$CONTEXT_FILE")"
-  node - "$CONTEXT_FILE" "$RESOLVED_REPO" "$BASE_REF" "$FEATURE_BRANCH" "$MR_ID" "$SERVER_URL" "$BEFORE_PATH" "$AFTER_PATH" "$before_commit" "$after_commit" "$ts" <<'NODE'
+  node - "$CONTEXT_FILE" "$RESOLVED_REPO" "$BASE_REF" "$FEATURE_BRANCH" "$REVIEW_ID" "$SERVER_URL" "$BEFORE_PATH" "$AFTER_PATH" "$before_commit" "$after_commit" "$ts" <<'NODE'
 const fs = require('node:fs');
-const [file, repoPath, baseBranch, featureBranch, mrId, serverUrl, beforePath, afterPath, beforeCommit, afterCommit, timestamp] = process.argv.slice(2);
+const [file, repoPath, baseBranch, featureBranch, reviewId, serverUrl, beforePath, afterPath, beforeCommit, afterCommit, timestamp] = process.argv.slice(2);
 const data = {
   repo_path: repoPath,
   base_branch: baseBranch,
   feature_branch: featureBranch,
-  mr_id: mrId || '',
+  review_id: reviewId || '',
   server_url: serverUrl,
   before_path: beforePath,
   after_path: afterPath,
@@ -269,30 +273,66 @@ process.stdout.write(encodeURIComponent(input));
 NODE
 }
 
-compute_gitlab_raw_base() {
-  local remote_url
-  remote_url="$(git -C "$RESOLVED_REPO" remote get-url origin)"
+parse_origin_url() {
+  ORIGIN_URL="$(git -C "$RESOLVED_REPO" remote get-url origin)"
+  ORIGIN_HOST=""
+  PROJECT_PATH=""
 
-  local host=""
-  local project_path=""
-
-  if [[ "$remote_url" =~ ^git@([^:]+):(.+)$ ]]; then
-    host="${BASH_REMATCH[1]}"
-    project_path="${BASH_REMATCH[2]}"
-  elif [[ "$remote_url" =~ ^https?://([^/]+)/(.+)$ ]]; then
-    host="${BASH_REMATCH[1]}"
-    project_path="${BASH_REMATCH[2]}"
+  if [[ "$ORIGIN_URL" =~ ^git@([^:]+):(.+)$ ]]; then
+    ORIGIN_HOST="${BASH_REMATCH[1]}"
+    PROJECT_PATH="${BASH_REMATCH[2]}"
+  elif [[ "$ORIGIN_URL" =~ ^ssh://git@([^/]+)/(.+)$ ]]; then
+    ORIGIN_HOST="${BASH_REMATCH[1]}"
+    PROJECT_PATH="${BASH_REMATCH[2]}"
+  elif [[ "$ORIGIN_URL" =~ ^https?://([^/]+)/(.+)$ ]]; then
+    ORIGIN_HOST="${BASH_REMATCH[1]}"
+    PROJECT_PATH="${BASH_REMATCH[2]}"
   else
     return 1
   fi
 
-  project_path="${project_path%.git}"
-  local branch_encoded
-  branch_encoded="$(encode_url_component "$FEATURE_BRANCH")"
-  printf 'https://%s/%s/-/raw/%s' "$host" "$project_path" "$branch_encoded"
+  PROJECT_PATH="${PROJECT_PATH%.git}"
+  [[ -n "$ORIGIN_HOST" && -n "$PROJECT_PATH" ]]
 }
 
-build_mr_section() {
+detect_git_provider() {
+  local host_lower
+  host_lower="$(printf '%s' "$ORIGIN_HOST" | tr '[:upper:]' '[:lower:]')"
+
+  if [[ "$host_lower" == *"github"* ]]; then
+    GIT_PROVIDER="github"
+    return
+  fi
+  if [[ "$host_lower" == *"gitlab"* ]]; then
+    GIT_PROVIDER="gitlab"
+    return
+  fi
+
+  GIT_PROVIDER="unknown"
+}
+
+build_image_links() {
+  local branch_encoded
+  branch_encoded="$(encode_url_component "$FEATURE_BRANCH")"
+  local branch_literal
+  branch_literal="$FEATURE_BRANCH"
+
+  case "$GIT_PROVIDER" in
+    gitlab)
+      printf 'https://%s/%s/-/raw/%s/%s\n' "$ORIGIN_HOST" "$PROJECT_PATH" "$branch_encoded" "$BEFORE_PATH"
+      printf 'https://%s/%s/-/raw/%s/%s\n' "$ORIGIN_HOST" "$PROJECT_PATH" "$branch_encoded" "$AFTER_PATH"
+      ;;
+    github)
+      printf 'https://%s/%s/blob/%s/%s?raw=1\n' "$ORIGIN_HOST" "$PROJECT_PATH" "$branch_literal" "$BEFORE_PATH"
+      printf 'https://%s/%s/blob/%s/%s?raw=1\n' "$ORIGIN_HOST" "$PROJECT_PATH" "$branch_literal" "$AFTER_PATH"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+build_review_section() {
   local before_link="$1"
   local after_link="$2"
 
@@ -307,28 +347,70 @@ build_mr_section() {
 EOF
 }
 
-update_mr_description() {
+build_default_review_template() {
+  local section_text="$1"
+  cat <<EOF
+## Summary
+
+- Capture BEFORE/AFTER screenshots for UI review.
+
+$section_text
+EOF
+}
+
+update_review_description() {
   local section_text="$1"
 
-  if [[ -z "$MR_ID" ]]; then
-    warn "No --mr-id provided. Skipping MR update."
+  if [[ -z "$REVIEW_ID" ]]; then
+    warn "No --review-id provided. Skipping review update."
     printf '%s\n' "$section_text"
     return
   fi
 
-  if ! command -v glab >/dev/null 2>&1; then
-    warn "glab is not installed. Cannot auto-update MR."
-    printf '\nPaste this into MR #%s description:\n\n%s\n' "$MR_ID" "$section_text"
+  local current_desc=""
+  local platform_label="review"
+
+  if [[ "$GIT_PROVIDER" == "gitlab" ]]; then
+    platform_label="MR"
+    if ! command -v glab >/dev/null 2>&1; then
+      warn "glab is not installed. Cannot auto-update GitLab MR."
+      printf '\nPaste this into %s #%s description:\n\n%s\n' "$platform_label" "$REVIEW_ID" "$section_text"
+      return
+    fi
+    current_desc="$(cd "$RESOLVED_REPO" && glab mr view "$REVIEW_ID" --json description --jq .description 2>/dev/null || true)"
+  elif [[ "$GIT_PROVIDER" == "github" ]]; then
+    platform_label="PR"
+    if ! command -v gh >/dev/null 2>&1; then
+      warn "gh is not installed. Cannot auto-update GitHub PR."
+      printf '\nPaste this into %s #%s description:\n\n%s\n' "$platform_label" "$REVIEW_ID" "$section_text"
+      return
+    fi
+    current_desc="$(cd "$RESOLVED_REPO" && gh pr view "$REVIEW_ID" --json body --jq .body 2>/dev/null || true)"
+  else
+    warn "Origin provider is unknown. Cannot auto-update review description."
+    printf '\nPaste this into review #%s description:\n\n%s\n' "$REVIEW_ID" "$section_text"
     return
   fi
 
-  local current_desc
-  current_desc="$(cd "$RESOLVED_REPO" && glab mr view "$MR_ID" --json description --jq .description 2>/dev/null || true)"
+  local has_existing_template="false"
+  if [[ -n "${current_desc//[[:space:]]/}" ]]; then
+    has_existing_template="true"
+  fi
+
+  if [[ "$has_existing_template" == "false" ]]; then
+    log "No existing $platform_label template found. Creating a new template body."
+    current_desc="$(build_default_review_template "$section_text")"
+  fi
 
   local new_desc
-  new_desc="$(node - "$current_desc" "$section_text" <<'NODE'
+  new_desc="$(node - "$current_desc" "$section_text" "$has_existing_template" <<'NODE'
 const currentDesc = process.argv[2] || '';
 const section = process.argv[3] || '';
+const hasExistingTemplate = process.argv[4] === 'true';
+if (!hasExistingTemplate) {
+  process.stdout.write(currentDesc.trimEnd() + '\n');
+  process.exit(0);
+}
 const regex = /\n?## Before & After[\s\S]*?(?=\n##\s|$)/m;
 const updated = regex.test(currentDesc)
   ? currentDesc.replace(regex, `\n${section}\n`)
@@ -337,8 +419,14 @@ process.stdout.write(updated);
 NODE
 )"
 
-  (cd "$RESOLVED_REPO" && glab mr update "$MR_ID" --description "$new_desc" >/dev/null)
-  log "Updated GitLab MR #$MR_ID description"
+  if [[ "$GIT_PROVIDER" == "gitlab" ]]; then
+    (cd "$RESOLVED_REPO" && glab mr update "$REVIEW_ID" --description "$new_desc" >/dev/null)
+    log "Updated GitLab MR #$REVIEW_ID description"
+    return
+  fi
+
+  (cd "$RESOLVED_REPO" && gh pr edit "$REVIEW_ID" --body "$new_desc" >/dev/null)
+  log "Updated GitHub PR #$REVIEW_ID description"
 }
 
 cleanup() {
@@ -355,8 +443,8 @@ parse_args() {
         REPO="${2:-}"
         shift 2
         ;;
-      --mr-id)
-        MR_ID="${2:-}"
+      --review-id)
+        REVIEW_ID="${2:-}"
         shift 2
         ;;
       --base-branch)
@@ -543,7 +631,7 @@ commit_and_push_screenshots() {
   log "Pushed branch $FEATURE_BRANCH"
 
   if [[ "$changed" == "false" ]]; then
-    log "Continuing to MR update despite no git diff"
+    log "Continuing to review update despite no git diff"
   fi
 }
 
@@ -561,6 +649,9 @@ main() {
   git -C "$RESOLVED_REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1 || fail "Not a git repository: $RESOLVED_REPO"
   [[ -f "$RESOLVED_REPO/package.json" ]] || fail "Missing package.json in repo: $RESOLVED_REPO"
   [[ -f "$CAPTURE_JS" ]] || fail "Missing capture helper: $CAPTURE_JS"
+  parse_origin_url || fail "Could not parse origin remote URL"
+  detect_git_provider
+  log "Detected git provider from origin: $GIT_PROVIDER ($ORIGIN_HOST)"
 
   validate_relative_repo_path "$BEFORE_PATH"
   validate_relative_repo_path "$AFTER_PATH"
@@ -611,7 +702,9 @@ main() {
     fi
     before_commit="$ctx_before"
     [[ -f "$RESOLVED_REPO/$BEFORE_PATH" ]] || fail "Missing BEFORE screenshot file at $BEFORE_PATH. Run --mode before again or use --mode both."
-    MR_ID="${MR_ID:-$(json_get_field "$CONTEXT_FILE" "mr_id")}"
+    if [[ -z "$REVIEW_ID" ]]; then
+      REVIEW_ID="$(json_get_field "$CONTEXT_FILE" "review_id")"
+    fi
   fi
 
   if [[ "$MODE" == "after" || "$MODE" == "both" ]]; then
@@ -627,18 +720,23 @@ main() {
     write_context "$before_commit" "$after_commit"
     commit_and_push_screenshots
 
-    local raw_base before_link after_link section
-    if raw_base="$(compute_gitlab_raw_base)"; then
-      before_link="$raw_base/$BEFORE_PATH"
-      after_link="$raw_base/$AFTER_PATH"
+    local before_link=""
+    local after_link=""
+    local section=""
+    local links=""
+    local -a link_lines=()
+    if links="$(build_image_links)"; then
+      mapfile -t link_lines <<<"$links"
+      before_link="${link_lines[0]:-}"
+      after_link="${link_lines[1]:-}"
     else
-      warn "Could not parse GitLab origin URL. Falling back to relative paths."
+      warn "Could not build provider-specific links from origin URL. Falling back to relative paths."
       before_link="$BEFORE_PATH"
       after_link="$AFTER_PATH"
     fi
 
-    section="$(build_mr_section "$before_link" "$after_link")"
-    update_mr_description "$section"
+    section="$(build_review_section "$before_link" "$after_link")"
+    update_review_description "$section"
   fi
 
   log "Done"
