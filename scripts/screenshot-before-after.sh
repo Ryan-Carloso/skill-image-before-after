@@ -17,8 +17,10 @@ SERVER_URL_SET="false"
 NO_SERVER="false"
 WAIT_TIMEOUT="60"
 BROWSER_PATH="/snap/bin/chromium"
-BEFORE_PATH="screenshots/before.png"
-AFTER_PATH="screenshots/after.png"
+BEFORE_PATH=""
+AFTER_PATH=""
+BEFORE_PATH_SET="false"
+AFTER_PATH_SET="false"
 CONTEXT_FILE="$HOME/.config/opencode/skills/screenshot-skill/state/context.json"
 MODE="auto"
 REUSE_BRANCH="false"
@@ -38,6 +40,10 @@ PROJECT_PATH=""
 GIT_PROVIDER="unknown"
 REVIEW_URL=""
 BEFORE_TMP_FILE=""
+RUN_FOLDER_NAME=""
+RUN_TIMESTAMP=""
+
+declare -a ACTIONS=()
 
 usage() {
   cat <<'EOF'
@@ -59,8 +65,8 @@ Optional:
   --no-server                     Do not start local dev server
   --wait-timeout <secs>           Default: 60
   --browser <path>                Default: /snap/bin/chromium
-  --before-path <path>            Default: screenshots/before.png
-  --after-path <path>             Default: screenshots/after.png
+  --before-path <path>            Default: <branch>-<timestamp>/before.png
+  --after-path <path>             Default: <branch>-<timestamp>/after.png
   --context-file <path>           Default: ~/.config/opencode/skills/screenshot-skill/state/context.json
   --mode <auto|before|after|both> Default: auto
   --reuse-branch                  Keep existing feature branch and avoid branch creation fallback
@@ -86,6 +92,23 @@ warn() {
 fail() {
   printf '[error] %s\n' "$*" >&2
   exit 1
+}
+
+add_action() {
+  local item="$1"
+  ACTIONS+=("$item")
+}
+
+emit_action_list() {
+  if [[ "${#ACTIONS[@]}" -eq 0 ]]; then
+    return
+  fi
+
+  printf 'Completed actions:\n'
+  local item
+  for item in "${ACTIONS[@]}"; do
+    printf -- '- %s\n' "$item"
+  done
 }
 
 ensure_command() {
@@ -136,9 +159,9 @@ write_context() {
   ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
   mkdir -p "$(dirname "$CONTEXT_FILE")"
-  node - "$CONTEXT_FILE" "$RESOLVED_REPO" "$BASE_REF" "$FEATURE_BRANCH" "$REVIEW_ID" "$SERVER_URL" "$BEFORE_PATH" "$AFTER_PATH" "$before_commit" "$after_commit" "$ts" <<'NODE'
+  node - "$CONTEXT_FILE" "$RESOLVED_REPO" "$BASE_REF" "$FEATURE_BRANCH" "$REVIEW_ID" "$SERVER_URL" "$BEFORE_PATH" "$AFTER_PATH" "$RUN_FOLDER_NAME" "$before_commit" "$after_commit" "$ts" <<'NODE'
 const fs = require('node:fs');
-const [file, repoPath, baseBranch, featureBranch, reviewId, serverUrl, beforePath, afterPath, beforeCommit, afterCommit, timestamp] = process.argv.slice(2);
+const [file, repoPath, baseBranch, featureBranch, reviewId, serverUrl, beforePath, afterPath, runFolderName, beforeCommit, afterCommit, timestamp] = process.argv.slice(2);
 const data = {
   repo_path: repoPath,
   base_branch: baseBranch,
@@ -147,6 +170,7 @@ const data = {
   server_url: serverUrl,
   before_path: beforePath,
   after_path: afterPath,
+  run_folder_name: runFolderName || '',
   before_commit: beforeCommit || '',
   after_commit: afterCommit || '',
   timestamp,
@@ -468,11 +492,13 @@ NODE
   if [[ "$GIT_PROVIDER" == "gitlab" ]]; then
     (cd "$RESOLVED_REPO" && glab mr update "$REVIEW_ID" --description "$new_desc" >/dev/null)
     log "Updated GitLab MR #$REVIEW_ID description"
+    add_action "Updated GitLab MR #$REVIEW_ID description"
     return
   fi
 
   (cd "$RESOLVED_REPO" && gh pr edit "$REVIEW_ID" --body "$new_desc" >/dev/null)
   log "Updated GitHub PR #$REVIEW_ID description"
+  add_action "Updated GitHub PR #$REVIEW_ID description"
 }
 
 cleanup() {
@@ -536,10 +562,12 @@ parse_args() {
         ;;
       --before-path)
         BEFORE_PATH="${2:-}"
+        BEFORE_PATH_SET="true"
         shift 2
         ;;
       --after-path)
         AFTER_PATH="${2:-}"
+        AFTER_PATH_SET="true"
         shift 2
         ;;
       --context-file)
@@ -657,6 +685,68 @@ normalize_server_runtime_for_expo() {
   fi
 }
 
+sanitize_branch_name_for_path() {
+  local branch_name="$1"
+  local sanitized
+  sanitized="$(printf '%s' "$branch_name" | tr '/ ' '-' | tr -c '[:alnum:]._-' '-')"
+  sanitized="$(printf '%s' "$sanitized" | sed -E 's/-+/-/g; s/^-+//; s/-+$//')"
+  if [[ -z "$sanitized" ]]; then
+    sanitized="branch"
+  fi
+  printf '%s\n' "$sanitized"
+}
+
+configure_output_paths_for_run() {
+  local ctx_before_path=""
+  local ctx_after_path=""
+  local ctx_folder=""
+  local safe_branch=""
+
+  if [[ "$BEFORE_PATH_SET" == "true" && "$AFTER_PATH_SET" == "false" ]]; then
+    AFTER_PATH="$(dirname "$BEFORE_PATH")/after.png"
+    AFTER_PATH_SET="true"
+  elif [[ "$BEFORE_PATH_SET" == "false" && "$AFTER_PATH_SET" == "true" ]]; then
+    BEFORE_PATH="$(dirname "$AFTER_PATH")/before.png"
+    BEFORE_PATH_SET="true"
+  fi
+
+  if [[ "$BEFORE_PATH_SET" == "true" && "$AFTER_PATH_SET" == "true" ]]; then
+    RUN_FOLDER_NAME="$(dirname "$BEFORE_PATH")"
+    return
+  fi
+
+  if [[ "$MODE" == "after" ]]; then
+    ctx_before_path="$(json_get_field "$CONTEXT_FILE" "before_path")"
+    ctx_after_path="$(json_get_field "$CONTEXT_FILE" "after_path")"
+
+    if [[ -n "$ctx_before_path" && -n "$ctx_after_path" ]]; then
+      BEFORE_PATH="$ctx_before_path"
+      AFTER_PATH="$ctx_after_path"
+      RUN_FOLDER_NAME="$(dirname "$ctx_before_path")"
+      if [[ "$RUN_FOLDER_NAME" == "." ]]; then
+        RUN_FOLDER_NAME="$(dirname "$ctx_after_path")"
+      fi
+      return
+    fi
+
+    ctx_folder="$(json_get_field "$CONTEXT_FILE" "run_folder_name")"
+    if [[ -z "$ctx_folder" && -n "$ctx_before_path" ]]; then
+      ctx_folder="$(dirname "$ctx_before_path")"
+    fi
+    if [[ -z "$ctx_folder" || "$ctx_folder" == "." ]]; then
+      fail "Mode 'after' requires run folder in context. Run --mode before or --mode both first."
+    fi
+    RUN_FOLDER_NAME="$ctx_folder"
+  else
+    RUN_TIMESTAMP="$(date -u +%Y%m%d-%H%M%SZ)"
+    safe_branch="$(sanitize_branch_name_for_path "$FEATURE_BRANCH")"
+    RUN_FOLDER_NAME="${safe_branch}-${RUN_TIMESTAMP}"
+  fi
+
+  BEFORE_PATH="$RUN_FOLDER_NAME/before.png"
+  AFTER_PATH="$RUN_FOLDER_NAME/after.png"
+}
+
 resolve_mode_from_context() {
   if [[ "$MODE" != "auto" ]]; then
     return
@@ -687,9 +777,11 @@ commit_screenshots() {
   if git -C "$RESOLVED_REPO" diff --cached --quiet; then
     changed="false"
     warn "No screenshot changes to commit (idempotent run)."
+    add_action "No screenshot file changes to commit"
   else
     git -C "$RESOLVED_REPO" commit -m "chore: update before-after screenshots" >/dev/null
     log "Committed screenshot changes"
+    add_action "Committed screenshot files"
   fi
 
   if [[ "$changed" == "false" ]]; then
@@ -700,6 +792,7 @@ commit_screenshots() {
 push_feature_branch() {
   git -C "$RESOLVED_REPO" push -u origin "$FEATURE_BRANCH" >/dev/null
   log "Pushed branch $FEATURE_BRANCH"
+  add_action "Pushed feature branch to origin"
 
 }
 
@@ -725,6 +818,7 @@ NODE
   if [[ -n "$output" ]]; then
     printf '%s\n' "$output"
   fi
+  add_action "Pushed feature branch with GitLab MR options"
 
   REVIEW_URL="$(node - "$output" <<'NODE'
 const input = process.argv[2] || '';
@@ -739,6 +833,7 @@ NODE
 
   if [[ -n "$REVIEW_URL" ]]; then
     log "Created GitLab MR: $REVIEW_URL"
+    add_action "Resolved GitLab MR URL"
   else
     warn "Could not confirm MR creation from push output"
   fi
@@ -762,10 +857,12 @@ NODE
 emit_review_url() {
   if [[ -n "$REVIEW_URL" ]]; then
     log "Review URL: $REVIEW_URL"
+    add_action "Review URL: $REVIEW_URL"
   elif [[ "$GIT_PROVIDER" == "gitlab" ]]; then
     local branch_encoded
     branch_encoded="$(encode_url_component "$FEATURE_BRANCH")"
     log "Review URL: https://$ORIGIN_HOST/$PROJECT_PATH/-/merge_requests/new?merge_request%5Bsource_branch%5D=$branch_encoded"
+    add_action "Review URL: https://$ORIGIN_HOST/$PROJECT_PATH/-/merge_requests/new?merge_request%5Bsource_branch%5D=$branch_encoded"
   fi
 }
 
@@ -897,6 +994,7 @@ NODE
 resolve_target_url() {
   if [[ -n "$TARGET_URL" ]]; then
     log "Using explicit target URL: $TARGET_URL"
+    add_action "Using explicit target URL"
     return
   fi
 
@@ -914,6 +1012,7 @@ resolve_target_url() {
   TARGET_URL="$(join_server_url_and_route "$SERVER_URL" "$inferred_route")"
   log "Auto-selected target route from diff: $inferred_route"
   log "Resolved target URL: $TARGET_URL"
+  add_action "Inferred target route from branch diff: $inferred_route"
 }
 
 main() {
@@ -933,9 +1032,6 @@ main() {
   detect_git_provider
   log "Detected git provider from origin: $GIT_PROVIDER ($ORIGIN_HOST)"
 
-  validate_relative_repo_path "$BEFORE_PATH"
-  validate_relative_repo_path "$AFTER_PATH"
-
   autodetect_web_script_and_server_cmd
   normalize_server_runtime_for_expo
 
@@ -953,7 +1049,13 @@ main() {
   git -C "$RESOLVED_REPO" fetch origin >/dev/null
   normalize_base_branch "$BASE_BRANCH_INPUT"
   resolve_mode_from_context
+  configure_output_paths_for_run
+  validate_relative_repo_path "$BEFORE_PATH"
+  validate_relative_repo_path "$AFTER_PATH"
   resolve_target_url
+  add_action "Capture folder: $RUN_FOLDER_NAME"
+  add_action "Before path: $BEFORE_PATH"
+  add_action "After path: $AFTER_PATH"
   log "Resolved mode: $MODE"
 
   local before_commit=""
@@ -963,6 +1065,7 @@ main() {
     log "Capturing BEFORE from $BASE_REF"
     git -C "$RESOLVED_REPO" checkout --detach "$BASE_REF" >/dev/null
     capture_shot "$BEFORE_PATH"
+    add_action "Captured BEFORE screenshot from $BASE_REF"
     before_commit="$(get_commit_hash)"
 
     if [[ "$MODE" == "both" ]]; then
@@ -973,6 +1076,7 @@ main() {
 
     write_context "$before_commit" ""
     log "Saved BEFORE context to $CONTEXT_FILE"
+    add_action "Saved context file"
   fi
 
   if [[ "$MODE" == "after" ]]; then
@@ -1005,6 +1109,7 @@ main() {
     fi
 
     capture_shot "$AFTER_PATH"
+    add_action "Captured AFTER screenshot from $FEATURE_BRANCH"
     after_commit="$(get_commit_hash)"
 
     if [[ "$MODE" == "both" ]]; then
@@ -1012,6 +1117,7 @@ main() {
     fi
 
     write_context "$before_commit" "$after_commit"
+    add_action "Updated context with BEFORE/AFTER commits"
     commit_screenshots
 
     local before_link=""
@@ -1042,6 +1148,8 @@ main() {
       review_body="$(build_default_review_template "$section")"
       create_gitlab_mr_via_push_options "$review_body"
       emit_review_url
+      add_action "Created or reused GitLab MR and printed review URL"
+      emit_action_list
       log "Done"
       return
     fi
@@ -1050,6 +1158,7 @@ main() {
     update_review_description "$section"
   fi
 
+  emit_action_list
   log "Done"
 }
 

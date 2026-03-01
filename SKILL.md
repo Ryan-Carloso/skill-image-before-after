@@ -18,6 +18,23 @@ This skill can:
 - Update an existing PR/MR when `--review-id` is provided.
 - On GitLab, auto-create an MR when `--review-id` is omitted.
 
+## Output Folder Convention
+
+By default, screenshots are saved in the project root under:
+
+- `/<branch>-<timestamp>/before.png`
+- `/<branch>-<timestamp>/after.png`
+
+Example folder name:
+
+- `feature-login-redesign-20260301-163522Z`
+
+Notes:
+
+- Folder name is built from feature branch + UTC timestamp.
+- The same folder is reused for `before` then `after` runs via context.
+- If you pass `--before-path` or `--after-path`, custom paths are respected.
+
 ## Target Route Resolution
 
 By default, the script does not hardcode a screen path.
@@ -145,6 +162,7 @@ Fields:
 - `server_url`
 - `before_path`
 - `after_path`
+- `run_folder_name`
 - `before_commit`
 - `after_commit`
 - `timestamp`
@@ -166,6 +184,7 @@ Auto mode behavior:
 - Uses Node-based server readiness checks (no curl dependency).
 - Uses bash-compatible parsing that works in macOS default shell environments.
 - Inferred target route comes from app route file changes in diff (`src/app/**`).
+- Prints a final action checklist (what was done) at the end of each run.
 
 ## Troubleshooting
 
