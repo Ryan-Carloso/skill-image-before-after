@@ -12,6 +12,8 @@ TARGET_URL=""
 SERVER_CMD=""
 SERVER_PORT="19006"
 SERVER_URL=""
+SERVER_PORT_SET="false"
+SERVER_URL_SET="false"
 NO_SERVER="false"
 WAIT_TIMEOUT="60"
 BROWSER_PATH="/snap/bin/chromium"
@@ -22,6 +24,7 @@ MODE="auto"
 REUSE_BRANCH="false"
 WAIT_UNTIL="networkidle2"
 DELAY_MS="500"
+EXPO_WEB_SERVER="false"
 
 ORIGINAL_BRANCH=""
 SERVER_PID=""
@@ -33,6 +36,8 @@ ORIGIN_URL=""
 ORIGIN_HOST=""
 PROJECT_PATH=""
 GIT_PROVIDER="unknown"
+REVIEW_URL=""
+BEFORE_TMP_FILE=""
 
 usage() {
   cat <<'EOF'
@@ -47,7 +52,7 @@ Optional:
   --review-id <id>                Pull request / merge request ID
   --base-branch <name>            Default: origin/main (accepts origin/main or main)
   --feature-branch <name>         Default: current branch
-  --url <url>                     Default: --server-url
+  --url <url>                     Default: inferred route from diff on --server-url
   --server-cmd <cmd>              Default: autodetect from package.json scripts
   --server-port <port>            Default: 19006
   --server-url <url>              Default: http://127.0.0.1:<port>
@@ -179,7 +184,28 @@ wait_for_server() {
   local timeout_secs="$1"
   local elapsed=0
   while (( elapsed < timeout_secs )); do
-    if curl -sS -o /dev/null "$SERVER_URL"; then
+    if node - "$SERVER_URL" <<'NODE'
+const raw = process.argv[2];
+if (!raw) process.exit(1);
+let parsed;
+try {
+  parsed = new URL(raw);
+} catch {
+  process.exit(1);
+}
+const mod = parsed.protocol === 'https:' ? require('node:https') : require('node:http');
+const req = mod.request(parsed, { method: 'GET', timeout: 2000 }, (res) => {
+  res.resume();
+  process.exit(0);
+});
+req.on('error', () => process.exit(1));
+req.on('timeout', () => {
+  req.destroy();
+  process.exit(1);
+});
+req.end();
+NODE
+    then
       log "Server reachable at $SERVER_URL"
       return
     fi
@@ -392,6 +418,11 @@ update_review_description() {
       printf '\nPaste this into %s #%s description:\n\n%s\n' "$platform_label" "$REVIEW_ID" "$section_text"
       return
     fi
+    if ! (cd "$RESOLVED_REPO" && glab auth status >/dev/null 2>&1); then
+      warn "glab is not authenticated. Cannot auto-update GitLab MR."
+      printf '\nPaste this into %s #%s description:\n\n%s\n' "$platform_label" "$REVIEW_ID" "$section_text"
+      return
+    fi
     current_desc="$(cd "$RESOLVED_REPO" && glab mr view "$REVIEW_ID" --json description --jq .description 2>/dev/null || true)"
   elif [[ "$GIT_PROVIDER" == "github" ]]; then
     platform_label="PR"
@@ -446,6 +477,9 @@ NODE
 
 cleanup() {
   stop_server
+  if [[ -n "$BEFORE_TMP_FILE" && -f "$BEFORE_TMP_FILE" ]]; then
+    rm -f "$BEFORE_TMP_FILE" || true
+  fi
   if [[ -n "$ORIGINAL_BRANCH" ]]; then
     git -C "$RESOLVED_REPO" checkout "$ORIGINAL_BRANCH" >/dev/null 2>&1 || true
   fi
@@ -480,10 +514,12 @@ parse_args() {
         ;;
       --server-port)
         SERVER_PORT="${2:-}"
+        SERVER_PORT_SET="true"
         shift 2
         ;;
       --server-url)
         SERVER_URL="${2:-}"
+        SERVER_URL_SET="true"
         shift 2
         ;;
       --no-server)
@@ -607,6 +643,20 @@ NODE
   [[ -n "$SERVER_CMD" ]] || fail "Unable to determine server command. Pass --server-cmd."
 }
 
+normalize_server_runtime_for_expo() {
+  local cmd_lc
+  cmd_lc="$(printf '%s' "$SERVER_CMD" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$cmd_lc" == *"expo start --web"* || "$cmd_lc" == "pnpm web" || "$cmd_lc" == "pnpm start:web" || "$cmd_lc" == "pnpm web:dev" ]]; then
+    EXPO_WEB_SERVER="true"
+  fi
+
+  if [[ "$EXPO_WEB_SERVER" == "true" ]]; then
+    if [[ "$SERVER_PORT_SET" == "false" && "$SERVER_URL_SET" == "false" ]]; then
+      SERVER_PORT="8081"
+    fi
+  fi
+}
+
 resolve_mode_from_context() {
   if [[ "$MODE" != "auto" ]]; then
     return
@@ -630,7 +680,7 @@ resolve_mode_from_context() {
   fi
 }
 
-commit_and_push_screenshots() {
+commit_screenshots() {
   local changed="true"
   git -C "$RESOLVED_REPO" add -- "$BEFORE_PATH" "$AFTER_PATH"
 
@@ -642,12 +692,228 @@ commit_and_push_screenshots() {
     log "Committed screenshot changes"
   fi
 
-  git -C "$RESOLVED_REPO" push -u origin "$FEATURE_BRANCH" >/dev/null
-  log "Pushed branch $FEATURE_BRANCH"
-
   if [[ "$changed" == "false" ]]; then
     log "Continuing to review update despite no git diff"
   fi
+}
+
+push_feature_branch() {
+  git -C "$RESOLVED_REPO" push -u origin "$FEATURE_BRANCH" >/dev/null
+  log "Pushed branch $FEATURE_BRANCH"
+
+}
+
+create_gitlab_mr_via_push_options() {
+  local description_text="$1"
+  local title_text
+  local description_compact
+  title_text="chore: update before-after screenshots"
+  description_compact="$(node - "$description_text" <<'NODE'
+const input = process.argv[2] || '';
+const compact = input.replace(/\r/g, '').replace(/\n+/g, ' ').replace(/\s{2,}/g, ' ').trim();
+process.stdout.write(compact);
+NODE
+)"
+  local output
+
+  output="$(git -C "$RESOLVED_REPO" push -u origin "$FEATURE_BRANCH" \
+    -o merge_request.create \
+    -o "merge_request.target=$BASE_LOCAL" \
+    -o "merge_request.title=$title_text" \
+    -o "merge_request.description=$description_compact" 2>&1 || true)"
+
+  if [[ -n "$output" ]]; then
+    printf '%s\n' "$output"
+  fi
+
+  REVIEW_URL="$(node - "$output" <<'NODE'
+const input = process.argv[2] || '';
+const match = input.match(/https:\/\/[^\s]+\/-\/merge_requests\/(\d+)/);
+if (!match) {
+  process.stdout.write('');
+  process.exit(0);
+}
+process.stdout.write(match[0]);
+NODE
+)"
+
+  if [[ -n "$REVIEW_URL" ]]; then
+    log "Created GitLab MR: $REVIEW_URL"
+  else
+    warn "Could not confirm MR creation from push output"
+  fi
+
+  local iid
+  iid="$(node - "$REVIEW_URL" <<'NODE'
+const url = process.argv[2] || '';
+const match = url.match(/\/merge_requests\/(\d+)/);
+if (!match) {
+  process.stdout.write('');
+  process.exit(0);
+}
+process.stdout.write(match[1]);
+NODE
+)"
+  if [[ -n "$iid" ]]; then
+    REVIEW_ID="$iid"
+  fi
+}
+
+emit_review_url() {
+  if [[ -n "$REVIEW_URL" ]]; then
+    log "Review URL: $REVIEW_URL"
+  elif [[ "$GIT_PROVIDER" == "gitlab" ]]; then
+    local branch_encoded
+    branch_encoded="$(encode_url_component "$FEATURE_BRANCH")"
+    log "Review URL: https://$ORIGIN_HOST/$PROJECT_PATH/-/merge_requests/new?merge_request%5Bsource_branch%5D=$branch_encoded"
+  fi
+}
+
+finalize_push_without_mr_creation() {
+  push_feature_branch
+
+  if [[ "$GIT_PROVIDER" == "gitlab" && -z "$REVIEW_ID" ]]; then
+    emit_review_url
+  fi
+}
+
+resolve_feature_ref_for_diff() {
+  local candidate="$1"
+
+  if [[ -z "$candidate" || "$candidate" == "HEAD" ]]; then
+    printf '%s\n' ""
+    return
+  fi
+
+  if git -C "$RESOLVED_REPO" show-ref --verify --quiet "refs/heads/$candidate"; then
+    printf '%s\n' "$candidate"
+    return
+  fi
+
+  if git -C "$RESOLVED_REPO" show-ref --verify --quiet "refs/remotes/origin/$candidate"; then
+    printf '%s\n' "origin/$candidate"
+    return
+  fi
+
+  printf '%s\n' ""
+}
+
+infer_target_route_from_diff() {
+  local feature_ref="$1"
+  local diff_files=""
+
+  if [[ -z "$feature_ref" ]]; then
+    printf '/\n'
+    return
+  fi
+
+  diff_files="$(git -C "$RESOLVED_REPO" diff --name-only "$BASE_REF...$feature_ref" 2>/dev/null || true)"
+
+  node - "$diff_files" <<'NODE'
+const input = process.argv[2] || '';
+const files = input
+  .split(/\r?\n/)
+  .map((line) => line.trim())
+  .filter(Boolean);
+
+const appFiles = files.filter((file) => /^src\/app\/.+\.(tsx|ts|jsx|js)$/.test(file));
+
+const excludedBaseNames = new Set(['_layout', '_sitemap', '+not-found']);
+
+function toRoute(filePath) {
+  const withoutPrefix = filePath.replace(/^src\/app\//, '');
+  const withoutExt = withoutPrefix.replace(/\.(tsx|ts|jsx|js)$/, '');
+  const rawSegments = withoutExt.split('/').filter(Boolean);
+  const routeSegments = [];
+
+  for (const segment of rawSegments) {
+    if (segment === 'index') {
+      continue;
+    }
+    if (segment.startsWith('(') && segment.endsWith(')')) {
+      continue;
+    }
+    if (segment.startsWith('[') && segment.endsWith(']')) {
+      routeSegments.push(segment.startsWith('[...') ? 'all' : '1');
+      continue;
+    }
+    if (segment.startsWith('_') || segment.startsWith('+')) {
+      continue;
+    }
+    routeSegments.push(segment);
+  }
+
+  const route = `/${routeSegments.join('/')}`.replace(/\/+/g, '/');
+  return route.length > 1 && route.endsWith('/') ? route.slice(0, -1) : route;
+}
+
+const candidates = [];
+for (const filePath of appFiles) {
+  const basenameWithExt = filePath.split('/').pop() || '';
+  const basename = basenameWithExt.replace(/\.(tsx|ts|jsx|js)$/, '');
+  if (excludedBaseNames.has(basename)) {
+    continue;
+  }
+  candidates.push({ filePath, route: toRoute(filePath) });
+}
+
+let chosen = '/';
+for (const candidate of candidates) {
+  if (candidate.route !== '/') {
+    chosen = candidate.route;
+    break;
+  }
+}
+
+if (chosen === '/' && candidates.length > 0) {
+  chosen = candidates[0].route;
+}
+
+process.stdout.write(chosen || '/');
+NODE
+}
+
+join_server_url_and_route() {
+  local server_url="$1"
+  local route_path="$2"
+
+  node - "$server_url" "$route_path" <<'NODE'
+const serverUrl = process.argv[2] || '';
+const routePath = process.argv[3] || '/';
+const normalizedPath = routePath.startsWith('/') ? routePath : `/${routePath}`;
+try {
+  const url = new URL(serverUrl);
+  const basePath = url.pathname.endsWith('/') ? url.pathname.slice(0, -1) : url.pathname;
+  url.pathname = `${basePath}${normalizedPath}`.replace(/\/+/g, '/');
+  url.search = '';
+  url.hash = '';
+  process.stdout.write(url.toString());
+} catch {
+  process.stdout.write(serverUrl);
+}
+NODE
+}
+
+resolve_target_url() {
+  if [[ -n "$TARGET_URL" ]]; then
+    log "Using explicit target URL: $TARGET_URL"
+    return
+  fi
+
+  local feature_ref_for_diff
+  local inferred_route
+
+  feature_ref_for_diff="$(resolve_feature_ref_for_diff "$FEATURE_BRANCH")"
+  if [[ -z "$feature_ref_for_diff" ]]; then
+    warn "Could not resolve feature branch ref for diff. Falling back to root route '/'."
+    inferred_route="/"
+  else
+    inferred_route="$(infer_target_route_from_diff "$feature_ref_for_diff")"
+  fi
+
+  TARGET_URL="$(join_server_url_and_route "$SERVER_URL" "$inferred_route")"
+  log "Auto-selected target route from diff: $inferred_route"
+  log "Resolved target URL: $TARGET_URL"
 }
 
 main() {
@@ -658,7 +924,6 @@ main() {
 
   ensure_command git
   ensure_command node
-  ensure_command curl
 
   RESOLVED_REPO="$(cd "$REPO" && pwd -P)"
   git -C "$RESOLVED_REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1 || fail "Not a git repository: $RESOLVED_REPO"
@@ -671,14 +936,12 @@ main() {
   validate_relative_repo_path "$BEFORE_PATH"
   validate_relative_repo_path "$AFTER_PATH"
 
+  autodetect_web_script_and_server_cmd
+  normalize_server_runtime_for_expo
+
   if [[ -z "$SERVER_URL" ]]; then
     SERVER_URL="http://127.0.0.1:${SERVER_PORT}"
   fi
-  if [[ -z "$TARGET_URL" ]]; then
-    TARGET_URL="$SERVER_URL"
-  fi
-
-  autodetect_web_script_and_server_cmd
   ORIGINAL_BRANCH="$(git -C "$RESOLVED_REPO" rev-parse --abbrev-ref HEAD)"
   if [[ -z "$FEATURE_BRANCH" ]]; then
     FEATURE_BRANCH="$ORIGINAL_BRANCH"
@@ -690,6 +953,7 @@ main() {
   git -C "$RESOLVED_REPO" fetch origin >/dev/null
   normalize_base_branch "$BASE_BRANCH_INPUT"
   resolve_mode_from_context
+  resolve_target_url
   log "Resolved mode: $MODE"
 
   local before_commit=""
@@ -700,6 +964,13 @@ main() {
     git -C "$RESOLVED_REPO" checkout --detach "$BASE_REF" >/dev/null
     capture_shot "$BEFORE_PATH"
     before_commit="$(get_commit_hash)"
+
+    if [[ "$MODE" == "both" ]]; then
+      BEFORE_TMP_FILE="$(mktemp -t screenshot-before.XXXXXX.png)"
+      cp "$RESOLVED_REPO/$BEFORE_PATH" "$BEFORE_TMP_FILE"
+      rm -f "$RESOLVED_REPO/$BEFORE_PATH"
+    fi
+
     write_context "$before_commit" ""
     log "Saved BEFORE context to $CONTEXT_FILE"
   fi
@@ -725,6 +996,14 @@ main() {
   if [[ "$MODE" == "after" || "$MODE" == "both" ]]; then
     log "Capturing AFTER from feature branch $FEATURE_BRANCH"
     switch_to_branch "$FEATURE_BRANCH"
+
+    if [[ -n "$BEFORE_TMP_FILE" && -f "$BEFORE_TMP_FILE" ]]; then
+      mkdir -p "$RESOLVED_REPO/$(dirname "$BEFORE_PATH")"
+      cp "$BEFORE_TMP_FILE" "$RESOLVED_REPO/$BEFORE_PATH"
+      rm -f "$BEFORE_TMP_FILE"
+      BEFORE_TMP_FILE=""
+    fi
+
     capture_shot "$AFTER_PATH"
     after_commit="$(get_commit_hash)"
 
@@ -733,17 +1012,24 @@ main() {
     fi
 
     write_context "$before_commit" "$after_commit"
-    commit_and_push_screenshots
+    commit_screenshots
 
     local before_link=""
     local after_link=""
     local section=""
+    local review_body=""
     local links=""
-    local -a link_lines=()
     if links="$(build_image_links)"; then
-      mapfile -t link_lines <<<"$links"
-      before_link="${link_lines[0]:-}"
-      after_link="${link_lines[1]:-}"
+      local line_index=0
+      while IFS= read -r link_line; do
+        if [[ "$line_index" -eq 0 ]]; then
+          before_link="$link_line"
+        elif [[ "$line_index" -eq 1 ]]; then
+          after_link="$link_line"
+          break
+        fi
+        line_index=$((line_index + 1))
+      done <<<"$links"
     else
       warn "Could not build provider-specific links from origin URL. Falling back to relative paths."
       before_link="$BEFORE_PATH"
@@ -751,6 +1037,16 @@ main() {
     fi
 
     section="$(build_review_section "$before_link" "$after_link")"
+
+    if [[ "$GIT_PROVIDER" == "gitlab" && -z "$REVIEW_ID" ]]; then
+      review_body="$(build_default_review_template "$section")"
+      create_gitlab_mr_via_push_options "$review_body"
+      emit_review_url
+      log "Done"
+      return
+    fi
+
+    finalize_push_without_mr_creation
     update_review_description "$section"
   fi
 

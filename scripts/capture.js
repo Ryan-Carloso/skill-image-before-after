@@ -130,7 +130,7 @@ async function main() {
     await page.setViewport({ width, height });
     await page.goto(url, { waitUntil });
     if (delayMs > 0) {
-      await page.waitForTimeout(delayMs);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
     await page.screenshot({ path: outputPath, fullPage });
     process.stdout.write(`Saved screenshot: ${output}\n`);

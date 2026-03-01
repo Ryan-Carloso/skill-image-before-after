@@ -1,56 +1,83 @@
 ---
 name: git-host-rn-web-before-after
-description: This skill should be used when a user needs automated BEFORE/AFTER screenshots for a React Native web app and wants to commit images to a feature branch and update an existing GitHub pull request or GitLab merge request description by auto-detecting the provider from origin.
+description: This skill should be used when a user needs automated BEFORE/AFTER screenshots for a React Native web app and wants to commit images to a feature branch and update or create a GitHub pull request or GitLab merge request by auto-detecting the provider from origin.
 ---
 
 # Git Host RN Web Before/After Screenshot Skill
 
-Keep scope narrow: capture screenshots only. Avoid implementing requested product code changes.
+Keep scope narrow: capture screenshots and review artifacts only. Do not implement product features.
 
 ## Purpose
 
-Capture deterministic BEFORE and AFTER screenshots of a React Native app running on web, store local run state, commit screenshots to a feature branch, and update an existing GitHub PR or GitLab MR description with image embeds.
+Capture deterministic BEFORE and AFTER screenshots for React Native Web, commit screenshot assets on a feature branch, and update review content.
 
-## When to Use
+This skill can:
 
-Use when the request is to:
+- Use one run (`both`) or two runs (`before` then `after`).
+- Auto-detect GitHub vs GitLab using `git remote get-url origin`.
+- Update an existing PR/MR when `--review-id` is provided.
+- On GitLab, auto-create an MR when `--review-id` is omitted.
 
-- Capture BEFORE/AFTER screenshots for UI review.
-- Attach screenshot evidence to an existing GitHub PR or GitLab MR.
-- Run in one pass (`both`) or two passes (`before` then `after`) using local context.
+## Target Route Resolution
 
-Do not use for app feature implementation or PR/MR template generation beyond the screenshot section.
+By default, the script does not hardcode a screen path.
+
+- If `--url` is provided, it uses that URL.
+- If `--url` is omitted, it infers a route from the feature diff against base (`<base>...<feature>`), prioritizing changed files under `src/app`.
+- If no route can be inferred, it falls back to `/`.
 
 ## Files
 
-- `scripts/screenshot-before-after.sh`: Main CLI workflow.
+- `scripts/screenshot-before-after.sh`: Main workflow.
 - `scripts/capture.js`: Puppeteer capture helper.
-- `scripts/package.json`: Node dependencies for capture helper.
+- `scripts/package.json`: Runtime dependencies and setup helpers.
 
-## Setup
+## Prerequisites
+
+- `git`
+- `node` (18+ recommended)
+- `pnpm`
+- Chromium/Chrome binary available to Puppeteer
+- Optional for automatic review description updates:
+  - `gh` for GitHub
+  - `glab` for GitLab
+
+## Setup (Step by Step)
 
 Run from this skill directory:
 
 ```bash
 cd skills/git-host-rn-web-before-after/scripts
-pnpm install
+pnpm run setup
+pnpm run browser:install
 chmod +x screenshot-before-after.sh
 ```
 
+Notes:
+
+- `pnpm run browser:install` installs Playwright Chromium in local user cache.
+- On macOS, a common browser path is:
+  - `~/Library/Caches/ms-playwright/chromium-1208/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing`
+- If your environment has another Chromium path, pass it via `--browser`.
+
 ## Usage
 
-Use `--review-id` for both GitHub PRs and GitLab MRs.
+Provider is always auto-detected from `origin`.
+Do not ask users to pick GitHub or GitLab when `origin` exists.
 
-Provider is always auto-detected from `git remote get-url origin`.
-Do not ask the user to choose GitHub vs GitLab when `origin` is available.
+### One-step (recommended)
 
-One-step run (recommended):
+```bash
+./screenshot-before-after.sh --repo /path/to/app --mode both
+```
+
+With explicit review ID:
 
 ```bash
 ./screenshot-before-after.sh --repo /path/to/app --review-id 123 --mode both
 ```
 
-Two-step run:
+### Two-step
 
 ```bash
 # Step 1: BEFORE only
@@ -60,26 +87,48 @@ Two-step run:
 ./screenshot-before-after.sh --repo /path/to/app --mode after
 ```
 
-Manual server mode:
+### RN Web debug mode (recommended for Expo)
+
+Use explicit URL, port, and loading options for deterministic captures when needed.
+If `--url` is omitted, route is inferred automatically from the branch diff:
 
 ```bash
 ./screenshot-before-after.sh \
   --repo /path/to/app \
-  --review-id 123 \
   --mode both \
-  --no-server \
-  --server-url http://127.0.0.1:19006
+  --server-cmd "pnpm web -- --port 8082 --clear" \
+  --server-port 8082 \
+  --wait-timeout 120 \
+  --wait-until networkidle2 \
+  --delay-ms 8000 \
+  --browser "/absolute/path/to/chromium"
 ```
 
-Provider-specific examples (same command shape):
+Optional override for a specific page:
 
 ```bash
-# GitHub repo (origin like git@github.com:org/repo.git)
-./screenshot-before-after.sh --repo /path/to/app --review-id 123 --mode both
-
-# GitLab repo (origin like git@gitlab.com:group/repo.git)
-./screenshot-before-after.sh --repo /path/to/app --review-id 123 --mode both
+./screenshot-before-after.sh \
+  --repo /path/to/app \
+  --mode both \
+  --url http://127.0.0.1:8082/some/route
 ```
+
+### Manual server mode
+
+```bash
+./screenshot-before-after.sh \
+  --repo /path/to/app \
+  --mode both \
+  --no-server \
+  --server-url http://127.0.0.1:19006 \
+  --browser "/absolute/path/to/chromium"
+```
+
+## GitLab MR behavior
+
+- If `--review-id` is provided, the script updates that MR description.
+- If `--review-id` is omitted on GitLab, the script attempts MR creation using push options and prints the MR URL.
+- If `glab` is not authenticated, screenshot capture/commit/push still works and the script prints markdown to paste manually.
 
 ## Context JSON
 
@@ -87,7 +136,7 @@ Default context path:
 
 `~/.config/opencode/skills/screenshot-skill/state/context.json`
 
-Context fields:
+Fields:
 
 - `repo_path`
 - `base_branch`
@@ -107,18 +156,22 @@ Auto mode behavior:
 
 ## Operational Notes
 
-- Inspect `<repo>/package.json` and require one of: `scripts.web`, `scripts["start:web"]`, `scripts["web:dev"]`.
-- Normalize base branch input so `origin/main` and `main` both work.
-- Restore original git branch at end, even on failure.
-- Prevent screenshot writes outside repo by rejecting absolute paths and traversal (`..`).
-- Detect provider from `git remote get-url origin` host.
-- Use `gh` for GitHub PR updates and `glab` for GitLab MR updates when available.
-- If provider CLI is unavailable (or provider cannot be recognized), print markdown snippet and manual instructions.
+- Requires one of these app scripts in target `package.json`:
+  - `scripts.web`
+  - `scripts["start:web"]`
+  - `scripts["web:dev"]`
+- Normalizes `--base-branch` so `origin/main` and `main` are both valid.
+- Restores the original git branch on exit, including failure paths.
+- Prevents write outside repo for screenshots (rejects absolute/traversal paths).
+- Uses Node-based server readiness checks (no curl dependency).
+- Uses bash-compatible parsing that works in macOS default shell environments.
+- Inferred target route comes from app route file changes in diff (`src/app/**`).
 
 ## Troubleshooting
 
-- If `origin` is GitLab, missing `gh` is irrelevant; only `glab` is needed for auto-update.
-- If `origin` is GitHub, missing `glab` is irrelevant; only `gh` is needed for auto-update.
-- If the target PR/MR has no description/template body, create a standardized template with `Summary`, `What Changed`, `Validation`, `Notes`, and the `Before & After` section.
-- This skill does not require `.github/pull_request_template.md` or GitLab MR template files to exist in the repository.
-- If no provider CLI is installed, still capture/commit/push screenshots and print markdown for manual paste.
+- **Port already in use**: pass `--server-cmd "pnpm web -- --port 8082 --clear" --server-port 8082`.
+- **Expo asks for interactive input**: force explicit `--port` and avoid auto-switch prompts.
+- **`window is not defined` or other app runtime error**: this is an app issue, not a skill issue; screenshots will reflect the error state.
+- **MR update fails with `glab` auth**: run `glab auth login`, or use printed markdown manually.
+- **GitLab push options fail on multiline description**: script now compacts template body for push-option compatibility.
+- **No provider CLI installed**: capture/commit/push continues; script prints markdown snippet for manual review description paste.
