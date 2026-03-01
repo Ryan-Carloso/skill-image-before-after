@@ -743,8 +743,9 @@ configure_output_paths_for_run() {
     RUN_FOLDER_NAME="${safe_branch}-${RUN_TIMESTAMP}"
   fi
 
-  BEFORE_PATH="$RUN_FOLDER_NAME/before.png"
-  AFTER_PATH="$RUN_FOLDER_NAME/after.png"
+  mkdir -p "$RESOLVED_REPO/screenshots"
+  BEFORE_PATH="screenshots/$RUN_FOLDER_NAME/before.png"
+  AFTER_PATH="screenshots/$RUN_FOLDER_NAME/after.png"
 }
 
 resolve_mode_from_context() {

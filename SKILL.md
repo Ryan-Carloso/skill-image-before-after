@@ -20,10 +20,10 @@ This skill can:
 
 ## Output Folder Convention
 
-By default, screenshots are saved in the project root under:
+By default, screenshots are saved in a `/screenshots/` folder in the project root:
 
-- `/<branch>-<timestamp>/before.png`
-- `/<branch>-<timestamp>/after.png`
+- `/screenshots/<branch>-<timestamp>/before.png`
+- `/screenshots/<branch>-<timestamp>/after.png`
 
 Example folder name:
 
@@ -31,6 +31,7 @@ Example folder name:
 
 Notes:
 
+- The `/screenshots/` folder is automatically created if it does not exist.
 - Folder name is built from feature branch + UTC timestamp.
 - The same folder is reused for `before` then `after` runs via context.
 - If you pass `--before-path` or `--after-path`, custom paths are respected.
